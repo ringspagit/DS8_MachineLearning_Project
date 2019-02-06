@@ -1,0 +1,221 @@
+---
+title: "Qualitative Activity Recognition of Weight Lifting"
+output:
+  pdf_document: default
+  html_document: default
+---
+#### Paul Ringsted, 5th February 2019 - Course 8 (Practical Machine Learning)
+
+```{r global_options, include=FALSE}
+library(knitr)
+opts_chunk$set(fig.width=6, fig.height=3.5, fig.pos = "H", echo=FALSE, eval=TRUE)
+```
+
+## Synopsis
+
+The purpose of this study was to analyze data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants, in order to predict a qualitative assessment of the exercise being performed, classified 5 different ways on a scale of A-E (A being specified execution of the exercise, and B-E corresponding to common mistakes).
+
+The dataset was first cleaned to remove columns with incomplete data.  We concluded that using a Random Forest algorithm with 5-fold cross validation, trained on 75% of the provided data and tested using the remaining 25% of the training data, provided an accuracy rate of 99.51% (with a 95% confidence interval of 99.27-99.69%).  The model was applied to the 20 test cases provided, which were all predicted correctly.
+
+### References
+
+Note: R code is reflected in the Appendix.  PDF was used as per prior projects instead of HTML.
+
+More information on the original study is available from the website here:
+
+http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har
+
+Guidance on configuration for parallel processing:
+
+https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-randomForestPerformance.md
+
+
+## Data Loading and Initial Analysis
+
+The training and testing data for this project are available here:
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+```{r libraries, message=FALSE}
+#-------------------------------------------------------------------------------------
+library(caret)
+library(parallel)
+library(doParallel)
+library(kableExtra)
+library(data.table)
+set.seed(23675)         # Set seed to make results reproducible
+
+```
+
+
+```{r load_data}
+#-------------------------------------------------------------------------------------
+# Load training data from working directory and perform initial review
+data<-read.csv('pml-training.csv',na.strings=c("","NA"))
+test<-read.csv('pml-testing.csv',na.strings=c("","NA"))
+
+# Split the data between data without NAs and with NAs
+data_nona<-data[rowSums(is.na(data)) == 0,]
+data_na<-data[rowSums(is.na(data)) > 0,]
+
+# Only keep columns for which the non-NA count equals to the rowcount (no NA data)
+# Strip first 7 columns which have information on the test case
+data_subcols<-data[,colSums(!is.na(data))==nrow(data)]
+data_subcols<-data_subcols[,-(1:7)]
+
+# Generate basic statistics table
+stats1<-transpose(as.data.frame(aggregate(data$classe,by=list(data$classe),FUN=length)$x))
+stats1<-cbind(dataset="Training total rows",tot=nrow(data),stats1)
+stats2<-transpose(as.data.frame(aggregate(data_na$classe,
+                                          by=list(data_na$classe),FUN=length)$x))
+stats2<-cbind(dataset="Training rows with NAs",tot=nrow(data_na),stats2)
+stats3<-transpose(as.data.frame(aggregate(data_nona$classe,
+                                          by=list(data_nona$classe),FUN=length)$x))
+stats3<-cbind(dataset="Training rows with no NAs",tot=nrow(data_nona),stats3)
+
+statstab <- rbind(stats1,stats2,stats3)
+statstab %>% kable(
+                col.names=c("Dataset","Rowcount","Classe A","Classe B","Classe C",
+                "Classe D","Classe E"),
+                booktabs=T,align=rep("r",6),digits=c(0,0,0,0,0,0),
+                caption="Rowcount by Classe for Training Data") %>%
+                kable_styling(latex_options = "hold_position")
+
+```
+
+Only `r nrow(data_nona)` rows have values for all columns, these correspond to records where the 'new_window' flag equals to 'yes'.  The training data provided has a time window structure to it based on participant and exercise.  For the purposes of this analysis we removed all columns which have NA values (which will exclude some data on the very small subset of complete rows, but this data is not useful if unavailable for all observations).  We also removed the first 7 columns, which provide test case and time window information, that should not be used as predictors.
+
+**The resulting dataset we will use to build the prediction model consists of `r nrow(data_subcols)` observations of the 'classe' outcome, on `r ncol(data_subcols)-1` predictors.**
+
+\newpage
+## Model Training
+
+As a starting point given the large number of predictors and need for high level of accuracy, we will execute a Random Forest model using 5-fold cross-validation as a baseline for the prediction model.  To help validate the accuracy prior to applying it to the provided "testing" data (20 cases), we will split the data into 75% observations for "training" and 25% for "validation".  This model was implemented using parallel processing.
+
+```{r data-partition}
+#-------------------------------------------------------------------------------------
+# Split 'training' dataset 75-25%
+intrain<-createDataPartition(data_subcols$classe,p=0.75)[[1]]
+data_train<-data_subcols[intrain,]
+data_valid<-data_subcols[-intrain,]
+
+# Build a basic stats table to check the partitions
+stats4<-transpose(as.data.frame(aggregate(data_train$classe,
+                                          by=list(data_train$classe),FUN=length)$x))
+stats4<-cbind(dataset="Training data - training subset",tot=nrow(data_train),stats4)
+stats5<-transpose(as.data.frame(aggregate(data_valid$classe,
+                                          by=list(data_valid$classe),FUN=length)$x))
+stats5<-cbind(dataset="Training data - validation subset",tot=nrow(data_valid),stats5)
+
+statstab2 <- rbind(stats4,stats5)
+statstab2 %>% kable(
+                col.names=c("Dataset","Rowcount","Classe A","Classe B","Classe C",
+                "Classe D","Classe E"),
+                booktabs=T,align=rep("r",6),digits=c(0,0,0,0,0,0),
+                caption="Breakdown of Training and Validation Datasets") %>%
+                kable_styling(latex_options = "hold_position")
+
+```
+
+```{r rf}
+#-------------------------------------------------------------------------------------
+# Set up training control structure & initiate clustering
+fitControl<-trainControl(method="cv",number=5,allowParallel=TRUE)
+cluster<-makeCluster(detectCores()-1)
+registerDoParallel(cluster)
+
+# Take a walk through the random forest
+fit<-train(classe~.,method="rf",data=data_train,trControl=fitControl)
+
+# Turn off clustering, return to single-threaded
+stopCluster(cluster)
+registerDoSEQ()
+
+```
+
+**The results of the model are as follows, showing an average accuracy over 5 folds of 99.13%**
+
+```{r rf-fit}
+#-------------------------------------------------------------------------------------
+# Display results from the fit and confusion matrix based on folds
+fit$finalModel
+confusionMatrix.train(fit)
+fit$resample
+
+```
+
+\newpage
+## Model Validation
+
+Next, we used the model to predict the classe for the validation population we set aside, and reviewed the resulting confusion matrix.  **This confirmed an acceptable accuracy rate of 99.51% (with a 95% confidence interval of 99.27-99.69%).**
+
+
+```{r rf-validation}
+#-------------------------------------------------------------------------------------
+# Run prediction against validation dataset and display confusion matrix
+pred<-predict(fit,data_valid)
+confusionMatrix(data_valid$classe,pred)
+
+```
+
+
+## Model Prediction of Testing Data
+
+**Finally, we can now predict the classe category A-E for the 20 "testing" observations provided, with the following results:**
+
+```{r rf-test}
+#-------------------------------------------------------------------------------------
+# Run prediction against test data and display the results
+predtest<-predict(fit,test)
+pred_df<-transpose(as.data.frame(predtest))
+colnames(pred_df)<- c(1:20)
+pred_df %>% kable(booktabs=T,
+                  caption="Results of Model Prediction on Testing Data") %>% 
+                kable_styling(latex_options = "hold_position")
+
+```
+
+
+\newpage
+## Appendix - Model Alternative with PCA
+
+Given the large number of predictors, we also tried to apply PCA pre-processing during the original model fitting, to see if that yields any improvement.  Dimensions of the PCA matrix:
+
+```{r rf-pca}
+#-------------------------------------------------------------------------------------
+# Pre-process with PCA
+pca<-preProcess(data_train,method="pca",thresh=0.8)
+data_pca<-predict(pca,data_train)
+dim(data_pca)
+
+#Turn on clustering
+cluster<-makeCluster(detectCores()-1)
+registerDoParallel(cluster)
+
+# Take a walk through the random forest
+fitpca<-train(classe~.,method="rf",data=data_pca,trControl=fitControl)
+
+# Turn off clustering, return to single-threaded
+stopCluster(cluster)
+registerDoSEQ()
+
+```
+
+The results of the model are as follows.  This showed a significant decrease in accuracy to 95% when using pre-processing, so **PCA was not used in the final model.**
+
+```{r rf-pca-fit}
+#-------------------------------------------------------------------------------------
+#Display results from the PCA model fit
+fitpca$finalModel
+confusionMatrix.train(fitpca)
+fitpca$resample
+
+```
+
+
+\newpage
+## Code Appendix - R Code
+```{r ref.label=knitr::all_labels(), echo = T, eval = F}
+```
